@@ -1,7 +1,13 @@
 """
 Vehicle Number Plate Detection Backend
 ---------------------------------------
-Upload a vehicle image -> detects the number plate region -> reads the text.
+Upload a vehicle image -> locates candidate plate regions using classical
+computer vision (edge detection + contour shape filtering) -> reads the
+text of each candidate with Tesseract OCR -> returns the best match.
+
+Uses Tesseract (lightweight, low memory) rather than a deep-learning OCR
+engine, since this needs to run comfortably within default cloud memory
+limits (e.g. Railway's free/starter tier).
 
 Endpoints:
   GET  /                 -> health check
@@ -14,14 +20,13 @@ import re
 
 import cv2
 import numpy as np
-import easyocr
+import pytesseract
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
 app = FastAPI(title="Vehicle Plate Detection API")
 
-# Allow requests from any frontend (adjust in production if needed)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,24 +34,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# EasyOCR reader is loaded once at startup (downloads its model the first
-# time it runs). This does both text DETECTION and RECOGNITION, so we don't
-# need a separate plate-localization step.
-reader = easyocr.Reader(["en"], gpu=False)
+MAX_DIMENSION = 1600  # cap the longest side to keep memory/time usage low
 
 # A plate-like string: mostly letters/digits, length 4-12 (covers most
 # country formats loosely). Tune this for your region if needed.
 PLATE_PATTERN = re.compile(r"^[A-Z0-9]{4,12}$")
 
 
-MAX_DIMENSION = 1280  # cap the longest side to keep memory usage low
-
-
 def read_image_from_upload(file_bytes: bytes) -> np.ndarray:
     image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
 
-    # Downscale large photos (phone cameras often shoot 3000px+ wide, which
-    # uses far more memory during OCR inference than needed for accuracy).
     width, height = image.size
     longest_side = max(width, height)
     if longest_side > MAX_DIMENSION:
@@ -57,28 +54,83 @@ def read_image_from_upload(file_bytes: bytes) -> np.ndarray:
     return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
 
+def find_candidate_regions(img: np.ndarray):
+    """Locate rectangular regions in the image that look like they could
+    be a license plate, based on aspect ratio and size. Returns a list of
+    (x, y, w, h) boxes, most-likely-first."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 11, 17, 17)
+    edged = cv2.Canny(gray, 30, 200)
+    edged = cv2.dilate(edged, np.ones((3, 3), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(
+        edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    img_h, img_w = gray.shape[:2]
+    img_area = img_h * img_w
+
+    boxes = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if h == 0:
+            continue
+        area = w * h
+        aspect_ratio = w / h
+
+        # A number plate is usually a wide rectangle, not tiny, not the
+        # whole image.
+        if (
+            2.0 <= aspect_ratio <= 6.0
+            and 0.0015 * img_area <= area <= 0.2 * img_area
+            and w > 60
+        ):
+            boxes.append((x, y, w, h))
+
+    # Larger candidates first tend to be more reliable.
+    boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
+    return boxes[:15]  # cap how many we OCR, for speed
+
+
+def ocr_region(img: np.ndarray, box) -> str:
+    x, y, w, h = box
+    pad = int(0.1 * h)
+    y1, y2 = max(0, y - pad), min(img.shape[0], y + h + pad)
+    x1, x2 = max(0, x - pad), min(img.shape[1], x + w + pad)
+    crop = img[y1:y2, x1:x2]
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.bilateralFilter(gray, 11, 17, 17)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    text = pytesseract.image_to_string(
+        thresh,
+        config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+    )
+    return re.sub(r"[^A-Z0-9]", "", text.upper())
+
+
 def find_plate_candidates(img: np.ndarray):
-    """Run OCR over the whole image and return results that look like a
-    plate, sorted by confidence (highest first)."""
-    results = reader.readtext(img)
+    """Find candidate plate regions, OCR each one, and return the ones
+    whose text looks like a plate -- sorted by how plate-like the region's
+    shape was (a reasonable proxy for confidence with this approach)."""
+    boxes = find_candidate_regions(img)
 
     candidates = []
-    for bbox, text, confidence in results:
-        cleaned = re.sub(r"[^A-Z0-9]", "", text.upper())
-        if PLATE_PATTERN.match(cleaned):
-            xs = [p[0] for p in bbox]
-            ys = [p[1] for p in bbox]
-            x, y = int(min(xs)), int(min(ys))
-            w, h = int(max(xs) - x), int(max(ys) - y)
+    for box in boxes:
+        text = ocr_region(img, box)
+        if PLATE_PATTERN.match(text):
+            x, y, w, h = box
             candidates.append(
                 {
-                    "text": cleaned,
-                    "confidence": float(confidence),
-                    "box": {"x": x, "y": y, "width": w, "height": h},
+                    "text": text,
+                    "confidence": None,  # classical CV approach has no
+                                          # calibrated confidence score
+                    "box": {"x": int(x), "y": int(y), "width": int(w), "height": int(h)},
                 }
             )
 
-    candidates.sort(key=lambda c: c["confidence"], reverse=True)
     return candidates
 
 
@@ -112,7 +164,6 @@ async def detect_plate(file: UploadFile = File(...)):
     return {
         "plate_found": True,
         "plate_text": best["text"],
-        "confidence": round(best["confidence"], 3),
         "box": best["box"],
         "other_candidates": candidates[1:],
     }
