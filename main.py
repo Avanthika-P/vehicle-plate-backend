@@ -39,8 +39,21 @@ reader = easyocr.Reader(["en"], gpu=False)
 PLATE_PATTERN = re.compile(r"^[A-Z0-9]{4,12}$")
 
 
+MAX_DIMENSION = 1280  # cap the longest side to keep memory usage low
+
+
 def read_image_from_upload(file_bytes: bytes) -> np.ndarray:
     image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+
+    # Downscale large photos (phone cameras often shoot 3000px+ wide, which
+    # uses far more memory during OCR inference than needed for accuracy).
+    width, height = image.size
+    longest_side = max(width, height)
+    if longest_side > MAX_DIMENSION:
+        scale = MAX_DIMENSION / longest_side
+        new_size = (int(width * scale), int(height * scale))
+        image = image.resize(new_size, Image.LANCZOS)
+
     return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
 
@@ -84,7 +97,10 @@ async def detect_plate(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Empty file uploaded")
 
     img = read_image_from_upload(file_bytes)
-    candidates = find_plate_candidates(img)
+    try:
+        candidates = find_plate_candidates(img)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"OCR processing failed: {exc}")
 
     if not candidates:
         return {
